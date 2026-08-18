@@ -98,12 +98,43 @@ LIQUIDITY_WATCH = {"LYSCF", "IKTSY", "BABAF", "CSUAY", "CHL", "INDO", "ISDE", "A
 # =============================================================================
 # DATA ENGINE
 # =============================================================================
+# Suffix -> currency map for FX cross-term detection (best-effort, not exhaustive).
+_SUFFIX_CCY = {
+    ".T": "JPY", ".NS": "INR", ".BO": "INR", ".SR": "SAR", ".AX": "AUD", ".TO": "CAD",
+    ".HK": "HKD", ".IL": "ILS", ".AD": "AED", ".PA": "EUR", ".MI": "EUR", ".AS": "EUR",
+    ".DE": "EUR", ".SW": "CHF", ".L": "GBP", ".KS": "KRW", ".SS": "CNY", ".SZ": "CNY"}
+
+
+def infer_currency(ticker: str) -> str:
+    """Best-effort currency inference from ticker suffix. US listings / ADRs and
+    '-USD' pairs default to USD, which is correct for the vast majority of the
+    grid but is a heuristic, not a data feed — treat FX flags as 'check this',
+    not as ground truth."""
+    if ticker.upper().endswith("-USD"):
+        return "USD"
+    for suf, ccy in _SUFFIX_CCY.items():
+        if ticker.upper().endswith(suf):
+            return ccy
+    return "USD"
+
+
 @st.cache_data(ttl=3600)
-def get_stock_data_isolated(tickers: List[str], start_date: str, end_date: str) -> Tuple[pd.DataFrame, List[str], List[str]]:
-    """Fetches tickers individually; isolates broken ones so they can't corrupt the set."""
+def get_stock_data_isolated(tickers: List[str], start_date: str, end_date: str
+                            ) -> Tuple[pd.DataFrame, List[str], List[str], Dict[str, Dict[str, float]]]:
+    """Fetches tickers individually; isolates broken ones so they can't corrupt the set.
+
+    Also returns a data_quality dict per working ticker with:
+      - real_count: number of genuinely observed (non-NaN, pre-fill) price points
+      - fill_ratio: fraction of the returned series that was ffill/bfill-padded
+      - first_valid: date of the first real observation (None if unknown)
+    This lets downstream code refuse to treat padded rows as real history —
+    ffill/bfill make gaps *look* continuous, but a stock that IPO'd 4 months
+    into a 3-year window will otherwise silently pass "252 days of history"
+    checks on mostly synthetic flat-lined data.
+    """
     if not tickers:
-        return pd.DataFrame(), [], []
-    successful_dfs, failed_tickers, working_tickers = {}, [], []
+        return pd.DataFrame(), [], [], {}
+    successful_dfs, failed_tickers, working_tickers, quality = {}, [], [], {}
     for ticker in tickers:
         try:
             data = yf.download(ticker, start=start_date, end=end_date, progress=False, timeout=10)
@@ -113,24 +144,50 @@ def get_stock_data_isolated(tickers: List[str], start_date: str, end_date: str) 
             df_col = data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
             if isinstance(df_col, pd.DataFrame):
                 df_col = df_col.iloc[:, 0]
-            successful_dfs[ticker] = df_col.ffill().bfill()
+            raw_col = df_col
+            real_count = int(raw_col.notna().sum())
+            total_count = int(len(raw_col))
+            first_valid = raw_col.first_valid_index()
+            filled = raw_col.ffill().bfill()
+            successful_dfs[ticker] = filled
             working_tickers.append(ticker)
+            quality[ticker] = {
+                "real_count": real_count,
+                "total_count": total_count,
+                "fill_ratio": float(1.0 - real_count / total_count) if total_count else 0.0,
+                "first_valid": first_valid.strftime("%Y-%m-%d") if first_valid is not None else None}
         except Exception:
             failed_tickers.append(ticker)
     if not successful_dfs:
-        return pd.DataFrame(), [], failed_tickers
-    return pd.DataFrame(successful_dfs), working_tickers, failed_tickers
+        return pd.DataFrame(), [], failed_tickers, {}
+    return pd.DataFrame(successful_dfs), working_tickers, failed_tickers, quality
+
+
+def _clip(v, lo=-5.0, hi=5.0):
+    return None if v is None else float(np.clip(v, lo, hi))
 
 
 def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base_ticker: str,
-                               mode: str = "trading") -> List[Dict[str, Any]]:
+                               mode: str = "trading",
+                               data_quality: Dict[str, Dict[str, float]] = None) -> List[Dict[str, Any]]:
     """Two-pass RS scoring. mode='trading' = 63D horizon score (original);
-    mode='longterm' = rank-based 252D/12-1 composite with convexity & crisis alpha."""
+    mode='longterm' = rank-based 252D/12-1 composite with convexity & crisis alpha,
+    where the convexity/crisis components are now computed on a genuine ~252D
+    window instead of silently reusing the 63D trading-window numbers.
+
+    data_quality (optional): per-ticker dict with 'real_count' (# of genuinely
+    observed, pre-fill price points). Used to gate long-window calcs so that
+    ffill/bfill padding on recently-listed tickers can't masquerade as real
+    252-day history.
+    """
     records = []
     if df.empty or base_ticker not in df.columns:
         return records
     base_prices = df[base_ticker]
     base_returns = base_prices.ffill().bfill().pct_change().fillna(0.0)
+    dq = data_quality or {}
+    base_real = dq.get(base_ticker, {}).get("real_count", len(base_prices))
+    base_ccy = infer_currency(base_ticker)
 
     raw: Dict[str, Dict[str, Any]] = {}
     for ticker in target_tickers:
@@ -142,6 +199,14 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
         clean_ratio = clean_ratio[clean_ratio > 0]
         if len(clean_ratio) < 10:
             continue
+
+        # Real (non-padded) history available for THIS pair — the binding
+        # constraint is whichever leg (asset or benchmark) has less genuine data.
+        t_real = dq.get(ticker, {}).get("real_count", len(t_price))
+        eff_real = min(t_real, base_real)
+        fill_ratio = float(dq.get(ticker, {}).get("fill_ratio", 0.0))
+        fx_mismatch = infer_currency(ticker) != base_ccy
+
         ratio_window = clean_ratio.tail(63)
         tail_index = ratio_window.index
         tail_returns = t_returns.loc[tail_index].fillna(0.0)
@@ -193,8 +258,15 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
                 slope_20d = float(sreg.coef_[0][0])
                 accel = slope_20d - slope_63d
 
-        max_dd = float(((t_price - t_price.cummax()) / t_price.cummax()).min())
-        dd_efficiency = rolling_alpha / max(abs(max_dd), 0.02)
+        # Full-period drawdown (used for LT "inv_dd" component & display) —
+        # kept separate from the 63D-matched drawdown used in the trading score.
+        max_dd_full = float(((t_price - t_price.cummax()) / t_price.cummax()).min())
+        tail_prices = t_price.loc[tail_index]
+        max_dd_63 = float(((tail_prices - tail_prices.cummax()) / tail_prices.cummax()).min()) \
+            if len(tail_prices) > 1 else 0.0
+        # dd_efficiency now divides a 63D alpha by a 63D drawdown — same horizon
+        # on both sides, instead of the old full-period/63D mismatch.
+        dd_efficiency = rolling_alpha / max(abs(max_dd_63), 0.02)
 
         long_slope, regime = None, "N/A"
         if len(clean_ratio) >= 200:
@@ -207,30 +279,55 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
                 regime = "Bull" if (lr2 > 0.3 and long_slope > 0) else ("Bear" if lr2 > 0.3 else "Neutral")
 
         # --- LONG-TERM MODE metrics: 252D trend, 12-1 skip-month rel. momentum,
-        # capture ratios (convexity) and crisis alpha (behaviour in stress) ---
+        # capture ratios (convexity) and crisis alpha (behaviour in stress).
+        # Gated on EFFECTIVE (real, non-padded) history, not on post-fill row
+        # count, so recently-listed tickers can't pass on synthetic flat data. ---
         slope_252d, rel_12_1 = None, None
-        if len(clean_ratio) >= 253:
+        has_252_real = eff_real >= 253
+        if len(clean_ratio) >= 253 and has_252_real:
             lw = np.log(clean_ratio.tail(252).values).reshape(-1, 1)
             lxw = np.arange(len(lw)).reshape(-1, 1)
             if np.isfinite(lw).all():
                 lreg = LinearRegression().fit(lxw, lw)
                 slope_252d = float(lreg.coef_[0][0])
             rel_12_1 = float(clean_ratio.iloc[-21] / clean_ratio.iloc[-252] - 1.0)
+
+        # 63D (trading-horizon) capture ratios — kept for the trading score / display.
         up_cap, down_cap = None, None
         up_m, dn_m = tail_base_returns > 0, tail_base_returns < 0
         if up_m.sum() > 5 and tail_base_returns[up_m].mean() != 0:
-            up_cap = float(tail_returns[up_m].mean() / tail_base_returns[up_m].mean())
+            up_cap = _clip(tail_returns[up_m].mean() / tail_base_returns[up_m].mean())
         if dn_m.sum() > 5 and tail_base_returns[dn_m].mean() != 0:
-            down_cap = float(tail_returns[dn_m].mean() / tail_base_returns[dn_m].mean())
+            down_cap = _clip(tail_returns[dn_m].mean() / tail_base_returns[dn_m].mean())
         worst = tail_base_returns.nsmallest(10)
         crisis_alpha = float(tail_returns.loc[worst.index].mean() - worst.mean())
 
+        # 252D (genuinely long-term) capture ratios & crisis alpha — these, not
+        # the 63D numbers above, feed the Long-Term Mode composite. Requires
+        # real (unpadded) history over the window, and more observations per
+        # bucket since the window is ~4x longer.
+        up_cap_lt, down_cap_lt, crisis_alpha_lt = None, None, None
+        if has_252_real:
+            lt_index = clean_ratio.tail(252).index
+            lt_returns = t_returns.loc[lt_index].fillna(0.0)
+            lt_base_returns = base_returns.loc[lt_index].fillna(0.0)
+            up_lt, dn_lt = lt_base_returns > 0, lt_base_returns < 0
+            if up_lt.sum() > 20 and lt_base_returns[up_lt].mean() != 0:
+                up_cap_lt = _clip(lt_returns[up_lt].mean() / lt_base_returns[up_lt].mean())
+            if dn_lt.sum() > 20 and lt_base_returns[dn_lt].mean() != 0:
+                down_cap_lt = _clip(lt_returns[dn_lt].mean() / lt_base_returns[dn_lt].mean())
+            worst_lt = lt_base_returns.nsmallest(20)
+            crisis_alpha_lt = float(lt_returns.loc[worst_lt.index].mean() - worst_lt.mean())
+
         raw[ticker] = dict(
             ret_1m=ret_1m, ret_3m=ret_3m, rolling_alpha=rolling_alpha, vol_adj_rs=vol_adj_rs,
-            is_breakout=is_breakout, r2=r2, slope_63d=slope_63d, accel=accel, max_dd=max_dd,
+            is_breakout=is_breakout, r2=r2, slope_63d=slope_63d, accel=accel,
+            max_dd=max_dd_full, max_dd_63=max_dd_63,
             dd_efficiency=dd_efficiency, long_slope=long_slope, regime=regime,
             slope_252d=slope_252d, rel_12_1=rel_12_1, up_cap=up_cap, down_cap=down_cap,
-            crisis_alpha=crisis_alpha)
+            crisis_alpha=crisis_alpha, up_cap_lt=up_cap_lt, down_cap_lt=down_cap_lt,
+            crisis_alpha_lt=crisis_alpha_lt, fill_ratio=fill_ratio, real_days=t_real,
+            fx_mismatch=fx_mismatch)
 
     if not raw:
         return records
@@ -240,17 +337,20 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
     universe_size = len(vol_adj_series)
     ordinal_rank = vol_adj_series.rank(ascending=False, method="min").astype(int)
 
-    # --- LONG-TERM composite: mean of component percentile ranks (no magic caps) ---
+    # --- LONG-TERM composite: mean of component percentile ranks (no magic caps).
+    # All six components are now genuinely long-window (252D-based); none of
+    # them silently fall back to the 63D trading-window statistics. ---
     def _pct(vals):
         present = {k: v for k, v in vals.items() if v is not None}
         if len(present) < 2:
             return {k: 50.0 for k in vals}
         s = pd.Series(present).rank(pct=True) * 100.0
         return {k: (float(s[k]) if k in s else 50.0) for k in vals}
-    comps = ["slope_252d", "rel_12_1", "ir_63d", "inv_downcap", "crisis_alpha", "inv_dd"]
-    src = {t: {"slope_252d": m["slope_252d"], "rel_12_1": m["rel_12_1"], "ir_63d": m["vol_adj_rs"],
-               "inv_downcap": None if m["down_cap"] is None else 1.0 - m["down_cap"],
-               "crisis_alpha": m["crisis_alpha"], "inv_dd": -abs(m["max_dd"])} for t, m in raw.items()}
+    comps = ["slope_252d", "rel_12_1", "ir_252d", "inv_downcap_lt", "crisis_alpha_lt", "inv_dd"]
+    src = {t: {"slope_252d": m["slope_252d"], "rel_12_1": m["rel_12_1"],
+               "ir_252d": m["rel_12_1"],  # rel_12_1 already IS a 252D-horizon relative-strength figure
+               "inv_downcap_lt": None if m["down_cap_lt"] is None else 1.0 - m["down_cap_lt"],
+               "crisis_alpha_lt": m["crisis_alpha_lt"], "inv_dd": -abs(m["max_dd"])} for t, m in raw.items()}
     ranks = {c: _pct({t: src[t][c] for t in raw}) for c in comps}
     lt_score = {t: float(np.mean([ranks[c][t] for c in comps])) for t in raw}
 
@@ -268,7 +368,7 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
             score += max(-8.0, min(m["accel"] * 800.0, 12.0))
         pct = float(percentile_rank[ticker])
         score += (pct - 50.0) / 50.0 * 10.0
-        score -= min(abs(m["max_dd"]) * 25.0, 15.0)
+        score -= min(abs(m["max_dd_63"]) * 25.0, 15.0)
         if m["dd_efficiency"] is not None:
             score += max(-6.0, min(m["dd_efficiency"] * 15.0, 10.0))
         trading_score = max(0.0, min(100.0, score))
@@ -289,8 +389,13 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
             "Trend R²": m["r2"], "RS Acceleration": m["accel"],
             "Drawdown Efficiency": round(m["dd_efficiency"], 2) if m["dd_efficiency"] is not None else None,
             "200D Trend Slope": m["long_slope"], "252D Slope": m["slope_252d"],
-            "12-1 Rel Mom": m["rel_12_1"], "Up Capture": m["up_cap"], "Down Capture": m["down_cap"],
-            "Crisis Alpha": m["crisis_alpha"], "Regime": m["regime"], "Max Drawdown": m["max_dd"]})
+            "12-1 Rel Mom": m["rel_12_1"],
+            "Up Capture": m["up_cap"], "Down Capture": m["down_cap"],
+            "Up Capture (LT)": m["up_cap_lt"], "Down Capture (LT)": m["down_cap_lt"],
+            "Crisis Alpha": m["crisis_alpha"], "Crisis Alpha (LT)": m["crisis_alpha_lt"],
+            "Regime": m["regime"], "Max Drawdown": m["max_dd"],
+            "Real Days": m["real_days"], "Data Fill %": m["fill_ratio"],
+            "FX Mismatch": "⚠️" if m["fx_mismatch"] else ""})
     return records
 
 
@@ -309,13 +414,13 @@ def generate_sizing_stress(start_date: str, end_date: str) -> Dict[str, Any]:
         vols = []
         for lay_key, cfg in layers.items():
             lay_w = _layer_weight(lay_key)
-            bm_df, _, _ = get_stock_data_isolated([cfg["benchmark"]], start_date, end_date)
+            bm_df, _, _, _ = get_stock_data_isolated([cfg["benchmark"]], start_date, end_date)
             if not bm_df.empty:
                 r = bm_df[cfg["benchmark"]].pct_change().dropna()
                 if len(r) > 63:
                     vols.append(float(r.tail(63).std() * np.sqrt(252)))
-            mem_df, _, _ = get_stock_data_isolated(cfg["tickers"], start_date, end_date)
-            for rec in generate_automated_scoring(mem_df, cfg["tickers"], cfg["benchmark"]):
+            mem_df, _, _, mem_dq = get_stock_data_isolated(cfg["tickers"], start_date, end_date)
+            for rec in generate_automated_scoring(mem_df, cfg["tickers"], cfg["benchmark"], data_quality=mem_dq):
                 total += 1
                 bull += rec["Regime"] == "Bull"
                 eff = sec_target * lay_w / max(len(cfg["tickers"]), 1)
@@ -323,11 +428,14 @@ def generate_sizing_stress(start_date: str, end_date: str) -> Dict[str, Any]:
                     concentration.append({"Ticker": rec["Asset"], "Section": sec, "Eff. Weight": eff})
                 if rec["Asset"] in LIQUIDITY_WATCH:
                     liq.append({"Ticker": rec["Asset"], "Section": sec, "Note": "OTC/thin — cap ~1% eff."})
+                elif rec["Data Fill %"] > 0.15:
+                    liq.append({"Ticker": rec["Asset"], "Section": sec,
+                                "Note": f"High data-fill ({rec['Data Fill %']:.0%}) — treat metrics with caution."})
         if vols:
             section_vols[sec] = float(np.mean(vols))
     breadth = bull / total if total else 0.5
     stress = 0.0
-    spy_df, _, _ = get_stock_data_isolated(["SPY"], start_date, end_date)
+    spy_df, _, _, _ = get_stock_data_isolated(["SPY"], start_date, end_date)
     if not spy_df.empty:
         sr = spy_df["SPY"].pct_change().dropna()
         if len(sr) > 200:
@@ -402,6 +510,16 @@ def run_pipeline(tickers, benchmark, start_date, end_date):
     return get_stock_data_isolated(all_requested, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
 
 
+def style_fill(val):
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return ''
+    if v > 0.30: return 'background-color: #b71c1c; color: white; font-weight: bold;'
+    if v > 0.15: return 'background-color: #ef6c00; color: white;'
+    return ''
+
+
 def style_signals(val):
     v = str(val)
     if "🏆 LEADER" in v: return 'background-color: #2e7d32; color: white; font-weight: bold;'
@@ -417,7 +535,8 @@ def style_regime(val):
     return 'color: #607d8b;'
 
 
-def render_results(price_df, working_list, failed_list, configured_tickers, benchmark_ticker, heading, lt_mode=False):
+def render_results(price_df, working_list, failed_list, configured_tickers, benchmark_ticker, heading,
+                   lt_mode=False, data_quality=None):
     if failed_list:
         failed_targets = [t for t in failed_list if t != benchmark_ticker]
         working_targets = [t for t in working_list if t != benchmark_ticker]
@@ -431,19 +550,33 @@ def render_results(price_df, working_list, failed_list, configured_tickers, benc
         st.error("Engine Data Failure: No usable operational target assets were loaded for this request.")
         return
     scored_records = generate_automated_scoring(price_df, configured_tickers, benchmark_ticker,
-                                                mode="longterm" if lt_mode else "trading")
+                                                mode="longterm" if lt_mode else "trading",
+                                                data_quality=data_quality)
     metrics_df = pd.DataFrame(scored_records)
     if metrics_df.empty:
         st.warning("No metrics compiled. Check tracking logs for verification.")
         return
     metrics_df = metrics_df.sort_values(by="Health Score", ascending=False)
     if lt_mode:
-        st.caption("🛡️ Long-Term Mode active — ranking on the 252D/12-1 rank composite (convexity & crisis alpha included).")
+        st.caption("🛡️ Long-Term Mode active — ranking on the 252D/12-1 rank composite "
+                   "(convexity & crisis alpha now computed on real ~252D history, not the 63D trading window).")
+    fx_flags = metrics_df.loc[metrics_df["FX Mismatch"] != "", "Asset"].tolist()
+    stale_flags = metrics_df.loc[metrics_df["Data Fill %"] > 0.15, "Asset"].tolist()
+    if fx_flags:
+        st.caption(f"⚠️ FX cross-term: `{', '.join(fx_flags)}` are priced in a different currency than "
+                   f"`{benchmark_ticker}` — their ratio/slope/momentum metrics embed an uncontrolled FX term.")
+    if stale_flags:
+        st.caption(f"⚠️ Data-fill warning: `{', '.join(stale_flags)}` have >15% of their price history "
+                   f"forward/back-filled (thin trading, halts, or a short listing history) — treat their "
+                   f"trend/momentum metrics with extra caution.")
     left_grid, right_heatmap = st.columns([0.65, 0.35])
     with left_grid:
         st.subheader(f"📊 {heading} Leadership Standings (vs {benchmark_ticker})")
+        display_cols = [c for c in metrics_df.columns if c not in ("Up Capture (LT)", "Down Capture (LT)",
+                                                                    "Crisis Alpha (LT)", "Real Days")]
         st.dataframe(
-            metrics_df.style.map(style_signals, subset=["Status"]).map(style_regime, subset=["Regime"])
+            metrics_df[display_cols].style.map(style_signals, subset=["Status"])
+            .map(style_regime, subset=["Regime"]).map(style_fill, subset=["Data Fill %"])
             .background_gradient(cmap="Blues", subset=["Health Score"])
             .format({
                 "1M Return": "{:.2%}", "3M Return": "{:.2%}", "63D Alpha vs BM": "{:+.2%}",
@@ -451,9 +584,14 @@ def render_results(price_df, working_list, failed_list, configured_tickers, benc
                 "RS Acceleration": "{:+.5f}", "Drawdown Efficiency": "{:+.2f}",
                 "200D Trend Slope": "{:.4f}", "Max Drawdown": "{:.2%}", "LT Score": "{:.1f}",
                 "252D Slope": "{:+.4f}", "12-1 Rel Mom": "{:+.2%}", "Up Capture": "{:.2f}",
-                "Down Capture": "{:.2f}", "Crisis Alpha": "{:+.4f}"
+                "Down Capture": "{:.2f}", "Crisis Alpha": "{:+.4f}", "Data Fill %": "{:.1%}"
             }, na_rep="N/A"),
             hide_index=True, use_container_width=True, height=330)
+        with st.expander("🔎 Long-Term convexity detail (252D-window capture ratios & crisis alpha)"):
+            lt_cols = ["Asset", "Up Capture (LT)", "Down Capture (LT)", "Crisis Alpha (LT)", "Real Days"]
+            st.dataframe(metrics_df[lt_cols].style.format(
+                {"Up Capture (LT)": "{:.2f}", "Down Capture (LT)": "{:.2f}", "Crisis Alpha (LT)": "{:+.4f}"},
+                na_rep="N/A — <253 real trading days"), hide_index=True, use_container_width=True)
     with right_heatmap:
         st.subheader("🔥 Layer Performance Heatmap")
         st.plotly_chart(generate_rotational_heatmap(
@@ -502,14 +640,17 @@ execute_adhoc = st.sidebar.button("Run Ad-Hoc Lookup", use_container_width=True,
 # --- MAIN PANEL ---
 if execute_run:
     with st.spinner(f"Extracting historical data arrays for {selected_layer}..."):
-        price_df, working_list, failed_list = run_pipeline(configured_tickers, benchmark_ticker, start_date, end_date)
+        price_df, working_list, failed_list, data_quality = run_pipeline(
+            configured_tickers, benchmark_ticker, start_date, end_date)
     st.session_state["grid_result"] = {"price_df": price_df, "working_list": working_list, "failed_list": failed_list,
                                        "configured_tickers": configured_tickers, "benchmark_ticker": benchmark_ticker,
-                                       "heading": selected_layer}
+                                       "heading": selected_layer, "data_quality": data_quality}
 if execute_adhoc:
     with st.spinner(f"Extracting historical data arrays for {len(adhoc_tickers)} ad-hoc ticker(s)..."):
-        price_df, working_list, failed_list = run_pipeline(adhoc_tickers, adhoc_benchmark, adhoc_start_date, adhoc_end_date)
+        price_df, working_list, failed_list, data_quality = run_pipeline(
+            adhoc_tickers, adhoc_benchmark, adhoc_start_date, adhoc_end_date)
     st.session_state["adhoc_result"] = {"price_df": price_df, "working_list": working_list, "failed_list": failed_list,
+                                        "data_quality": data_quality,
                                         "configured_tickers": adhoc_tickers, "benchmark_ticker": adhoc_benchmark,
                                         "heading": "Ad-Hoc Search"}
 
@@ -518,14 +659,16 @@ with tab_grid:
     result = st.session_state.get("grid_result")
     if result:
         render_results(result["price_df"], result["working_list"], result["failed_list"],
-                       result["configured_tickers"], result["benchmark_ticker"], result["heading"], lt_mode=lt_mode)
+                       result["configured_tickers"], result["benchmark_ticker"], result["heading"],
+                       lt_mode=lt_mode, data_quality=result.get("data_quality"))
     else:
         st.info("💡 Select a portfolio segment from the sidebar menus and run the engine.")
 with tab_adhoc:
     result = st.session_state.get("adhoc_result")
     if result:
         render_results(result["price_df"], result["working_list"], result["failed_list"],
-                       result["configured_tickers"], result["benchmark_ticker"], result["heading"], lt_mode=lt_mode)
+                       result["configured_tickers"], result["benchmark_ticker"], result["heading"],
+                       lt_mode=lt_mode, data_quality=result.get("data_quality"))
     else:
         st.info("🔍 Search or type any ticker in the sidebar's Ad-Hoc box, set a baseline, and run the lookup.")
 with tab_sizing:
