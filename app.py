@@ -339,20 +339,44 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
 
     # --- LONG-TERM composite: mean of component percentile ranks (no magic caps).
     # All six components are now genuinely long-window (252D-based); none of
-    # them silently fall back to the 63D trading-window statistics. ---
+    # them silently fall back to the 63D trading-window statistics.
+    #
+    # NOTE: percentile ranking needs a peer group. With a single asset in `raw`
+    # (e.g. a solo ad-hoc lookup), there's nothing to rank against, so we fall
+    # back to an ABSOLUTE score built from the raw long-term metrics instead of
+    # returning a fake-neutral 50 for everything. `lt_score_is_relative` records
+    # which method was used so the UI can tell the user which one they're seeing. ---
+    lt_score_is_relative = len(raw) >= 2
+
     def _pct(vals):
         present = {k: v for k, v in vals.items() if v is not None}
         if len(present) < 2:
             return {k: 50.0 for k in vals}
         s = pd.Series(present).rank(pct=True) * 100.0
         return {k: (float(s[k]) if k in s else 50.0) for k in vals}
+
+    def _abs_score(v, lo, hi):
+        """Map a raw metric onto 0-100 using fixed, asset-agnostic bounds — used
+        only when there's no peer group to rank against."""
+        if v is None:
+            return 50.0
+        return float(np.clip((v - lo) / (hi - lo) * 100.0, 0.0, 100.0))
+
     comps = ["slope_252d", "rel_12_1", "ir_252d", "inv_downcap_lt", "crisis_alpha_lt", "inv_dd"]
     src = {t: {"slope_252d": m["slope_252d"], "rel_12_1": m["rel_12_1"],
                "ir_252d": m["rel_12_1"],  # rel_12_1 already IS a 252D-horizon relative-strength figure
                "inv_downcap_lt": None if m["down_cap_lt"] is None else 1.0 - m["down_cap_lt"],
                "crisis_alpha_lt": m["crisis_alpha_lt"], "inv_dd": -abs(m["max_dd"])} for t, m in raw.items()}
-    ranks = {c: _pct({t: src[t][c] for t in raw}) for c in comps}
-    lt_score = {t: float(np.mean([ranks[c][t] for c in comps])) for t in raw}
+    if lt_score_is_relative:
+        ranks = {c: _pct({t: src[t][c] for t in raw}) for c in comps}
+        lt_score = {t: float(np.mean([ranks[c][t] for c in comps])) for t in raw}
+    else:
+        # Fixed bounds chosen from typical ranges for each metric so a lone
+        # ticker still gets a real, if rougher, absolute long-term read.
+        bounds = {"slope_252d": (-0.003, 0.003), "rel_12_1": (-0.30, 0.30), "ir_252d": (-0.30, 0.30),
+                  "inv_downcap_lt": (0.0, 2.0), "crisis_alpha_lt": (-0.03, 0.03), "inv_dd": (-0.60, 0.0)}
+        lt_score = {t: float(np.mean([_abs_score(src[t][c], *bounds[c]) for c in comps])) for t in raw}
+
 
     for ticker, m in raw.items():
         score = 15.0
@@ -395,7 +419,8 @@ def generate_automated_scoring(df: pd.DataFrame, target_tickers: List[str], base
             "Crisis Alpha": m["crisis_alpha"], "Crisis Alpha (LT)": m["crisis_alpha_lt"],
             "Regime": m["regime"], "Max Drawdown": m["max_dd"],
             "Real Days": m["real_days"], "Data Fill %": m["fill_ratio"],
-            "FX Mismatch": "⚠️" if m["fx_mismatch"] else ""})
+            "FX Mismatch": "⚠️" if m["fx_mismatch"] else "",
+            "LT Score Basis": "Peer-relative" if lt_score_is_relative else "Absolute (single-asset, no peers)"})
     return records
 
 
@@ -560,6 +585,10 @@ def render_results(price_df, working_list, failed_list, configured_tickers, benc
     if lt_mode:
         st.caption("🛡️ Long-Term Mode active — ranking on the 252D/12-1 rank composite "
                    "(convexity & crisis alpha now computed on real ~252D history, not the 63D trading window).")
+        if (metrics_df["LT Score Basis"] == "Absolute (single-asset, no peers)").any():
+            st.caption("ℹ️ Only one asset in this run, so LT Score can't be peer-ranked — it's computed from "
+                      "fixed absolute bounds on each metric instead. Treat it as a rough directional read, "
+                      "not a precise percentile; add more tickers to this search for a proper relative score.")
     fx_flags = metrics_df.loc[metrics_df["FX Mismatch"] != "", "Asset"].tolist()
     stale_flags = metrics_df.loc[metrics_df["Data Fill %"] > 0.15, "Asset"].tolist()
     if fx_flags:
@@ -573,7 +602,8 @@ def render_results(price_df, working_list, failed_list, configured_tickers, benc
     with left_grid:
         st.subheader(f"📊 {heading} Leadership Standings (vs {benchmark_ticker})")
         display_cols = [c for c in metrics_df.columns if c not in ("Up Capture (LT)", "Down Capture (LT)",
-                                                                    "Crisis Alpha (LT)", "Real Days")]
+                                                                    "Crisis Alpha (LT)", "Real Days",
+                                                                    "LT Score Basis")]
         st.dataframe(
             metrics_df[display_cols].style.map(style_signals, subset=["Status"])
             .map(style_regime, subset=["Regime"]).map(style_fill, subset=["Data Fill %"])
